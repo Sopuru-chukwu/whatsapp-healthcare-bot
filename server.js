@@ -1,33 +1,29 @@
-// server.js
 import express from 'express';
 import bodyParser from 'body-parser';
 import twilio from 'twilio';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
-import { createRequire } from 'module';
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
-
-const require = createRequire(import.meta.url);
-const serviceAccount = require('./firebase-service-account.json');
 
 dotenv.config();
 
-// Initialize Firebase
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json()); // For parsing application/json from Twilio (esp. in testing)
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_JSON);
+
+// Initialize Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-
-// Gemini API Configuration
+// Gemini config
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL_NAME = "gemini-1.5-flash-latest";
 
-// Initialize Google AI Client
-let genAI;
-let model;
+let genAI, model;
 if (GEMINI_API_KEY) {
   genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   model = genAI.getGenerativeModel({
@@ -51,7 +47,7 @@ if (GEMINI_API_KEY) {
     },
   });
 } else {
-  console.error("❌ FATAL: Missing GEMINI_API_KEY environment variable. Gemini functionality will be disabled.");
+  console.error("❌ Missing GEMINI_API_KEY");
 }
 
 app.post('/webhook', async (req, res) => {
@@ -61,25 +57,30 @@ app.post('/webhook', async (req, res) => {
 
   if (!model) {
     const twimlError = new twilio.twiml.MessagingResponse();
-    twimlError.message("Sorry, my AI component is not configured correctly. I cannot process requests right now.");
+    twimlError.message("Sorry, the AI assistant is not configured right now.");
     res.set('Content-Type', 'text/xml');
     return res.status(500).send(twimlError.toString());
   }
 
   try {
+    const resetTriggers = ['reset', 'clear', 'start over'];
+    if (resetTriggers.includes(incomingMsg.trim().toLowerCase())) {
+      await db.collection('context').doc(from).delete();
+      const twimlReset = new twilio.twiml.MessagingResponse();
+      twimlReset.message("🧼 Context cleared. Let’s start fresh!");
+      res.set('Content-Type', 'text/xml');
+      return res.send(twimlReset.toString());
+    }
+
     let contextData = { history: [] };
     const contextRef = db.collection('context').doc(from);
     const contextDoc = await contextRef.get();
-
-    if (contextDoc.exists) {
-      contextData = contextDoc.data();
-    }
+    if (contextDoc.exists) contextData = contextDoc.data();
 
     contextData.history.push({ role: 'user', content: incomingMsg });
-    if (contextData.history.length > 6) contextData.history = contextData.history.slice(-6); // Keep last 6 messages
+    if (contextData.history.length > 6) contextData.history = contextData.history.slice(-6);
 
     const reply = await getHealthReplyWithGeminiSDK(contextData.history);
-
     contextData.history.push({ role: 'assistant', content: reply });
     await contextRef.set(contextData, { merge: true });
 
@@ -93,17 +94,14 @@ app.post('/webhook', async (req, res) => {
     const twiml = new twilio.twiml.MessagingResponse();
     twiml.message(`${reply}
 
-⚠️ *Disclaimer: I am an AI assistant. This information is not a substitute for professional medical advice. Always consult a qualified healthcare provider.*`);
-
+⚠️ *Disclaimer: I am an AI assistant. This is not medical advice. Always consult a doctor.*`);
     res.set('Content-Type', 'text/xml');
     res.send(twiml.toString());
   } catch (error) {
-    console.error('❌ Error handling message:', error);
-    let userMessage = "Sorry, I encountered an error while trying to generate a response. Please try again later.";
-    if (error.message.includes('Response was blocked due to SAFETY')) {
-      userMessage = "I cannot provide information on this topic due to safety guidelines. Please consult a healthcare professional.";
-    } else if (error.message.includes('finishReason: SAFETY')) {
-      userMessage = "My response was stopped due to safety guidelines. Please consult a healthcare professional.";
+    console.error('❌ Error:', error);
+    let userMessage = "Sorry, I encountered an error. Please try again later.";
+    if (error.message.includes('SAFETY')) {
+      userMessage = "This topic may be sensitive. Please consult a healthcare provider.";
     }
 
     const twiml = new twilio.twiml.MessagingResponse();
@@ -113,35 +111,29 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-async function getHealthReplyWithGeminiSDK(conversationHistory) {
-  if (!model) throw new Error("Gemini model is not initialized.");
+async function getHealthReplyWithGeminiSDK(history) {
+  if (!model) throw new Error("Gemini model not initialized.");
 
-  const prompt = conversationHistory.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
-
-  console.log(`⚙️ Prompt to Gemini SDK:\n${prompt.slice(0, 300)}...`);
+  const prompt = history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
+  console.log(`⚙️ Gemini Prompt:\n${prompt.slice(0, 300)}...`);
 
   try {
     const result = await model.generateContent(prompt);
     const response = result.response;
 
-    if (response.promptFeedback?.blockReason) {
-      console.warn(`⚠️ Blocked. Reason: ${response.promptFeedback.blockReason}`);
-      return `I cannot process this request due to safety guidelines (${response.promptFeedback.blockReason}). Please consult a healthcare professional.`;
+    if (response?.promptFeedback?.blockReason) {
+      console.warn(`⚠️ Blocked: ${response.promptFeedback.blockReason}`);
+      return `I cannot respond due to safety guidelines. (${response.promptFeedback.blockReason})`;
     }
 
-    const text = response.text();
-    console.log(`✅ Gemini response: ${text.slice(0, 100)}...`);
-    return text.trim();
-  } catch (error) {
-    console.error('❌ Gemini SDK error:', error);
-    if (error.message.includes('finishReason: SAFETY')) {
-      throw new Error('Response generation stopped due to SAFETY');
-    }
-    throw new Error(`Failed to get reply from Gemini SDK: ${error.message}`);
+    return response.text().trim();
+  } catch (err) {
+    console.error("Gemini error:", err);
+    throw err;
   }
 }
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Healthcare Bot (Gemini SDK) running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
